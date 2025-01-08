@@ -883,14 +883,13 @@ func (js *jetStream) apiDispatch(sub *subscription, c *client, acc *Account, sub
 	// If we are here we have received this request over a non-client connection.
 	// We need to make sure not to block. We will send the request to a long-lived
 	// pool of go routines.
-
-	// Increment inflight. Do this before queueing.
-	atomic.AddInt64(&js.apiInflight, 1)
-
 	// Copy the state. Note the JSAPI only uses the hdr index to piece apart the
 	// header from the msg body. No other references are needed.
 	// Check pending and warn if getting backed up.
-	pending, _ := s.jsAPIRoutedReqs.push(&jsAPIRoutedReq{jsub, sub, acc, subject, reply, copyBytes(rmsg), c.pa})
+	pending, err := s.jsAPIRoutedReqs.push(&jsAPIRoutedReq{jsub, sub, acc, subject, reply, copyBytes(rmsg), c.pa})
+	if err == nil {
+		atomic.AddInt64(&js.apiInflight, 1)
+	}
 	limit := atomic.LoadInt64(&js.queueLimit)
 	if pending >= int(limit) {
 		s.rateLimitFormatWarnf("JetStream API queue limit reached, dropping %d requests", pending)
@@ -926,7 +925,7 @@ func (s *Server) processJSAPIRoutedRequests() {
 			// Only pop one item at a time here, otherwise if the system is recovering
 			// from queue buildup, then one worker will pull off all the tasks and the
 			// others will be starved of work.
-			for r, ok := queue.popOne(); ok && r != nil; r, ok = queue.popOne() {
+			for r, ok := queue.popOneLast(); ok && r != nil; r, ok = queue.popOneLast() {
 				client.pa = r.pa
 				start := time.Now()
 				r.jsub.icb(r.sub, client, r.acc, r.subject, r.reply, r.msg)
