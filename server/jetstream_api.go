@@ -888,12 +888,14 @@ func (js *jetStream) apiDispatch(sub *subscription, c *client, acc *Account, sub
 	// Check pending and warn if getting backed up.
 	limit := atomic.LoadInt64(&js.queueLimit)
 retry:
+	atomic.AddInt64(&js.apiInflight, 1)
 	pending, _ := s.jsAPIRoutedReqs.push(&jsAPIRoutedReq{jsub, sub, acc, subject, reply, copyBytes(rmsg), c.pa})
 	if pending >= int(limit) {
 		if _, ok := s.jsAPIRoutedReqs.popOne(); ok {
 			// If we were able to take one of the oldest items off the queue, then
 			// retry the insert.
 			s.rateLimitFormatWarnf("JetStream API queue limit reached, dropping oldest request")
+			atomic.AddInt64(&js.apiInflight, -1)
 			s.publishAdvisory(nil, JSAdvisoryAPILimitReached, JSAPILimitReachedAdvisory{
 				TypedEvent: TypedEvent{
 					Type: JSAPILimitReachedAdvisoryType,
@@ -910,8 +912,8 @@ retry:
 		// It's likely not possible to get to this point, but if for some reason we have got here,
 		// then something is wrong for us to be both over the limit but unable to pull entries, so
 		// throw everything away and hope we recover from it.
-		s.rateLimitFormatWarnf("JetStream API queue limit reached, dropping %d requests", pending)
 		drained := int64(s.jsAPIRoutedReqs.drain())
+		s.rateLimitFormatWarnf("JetStream API queue limit reached, dropping %d requests", drained)
 		atomic.AddInt64(&js.apiInflight, -drained)
 
 		s.publishAdvisory(nil, JSAdvisoryAPILimitReached, JSAPILimitReachedAdvisory{
@@ -924,8 +926,6 @@ retry:
 			Domain:  js.config.Domain,
 			Dropped: drained,
 		})
-	} else {
-		atomic.StoreInt64(&js.apiInflight, int64(pending))
 	}
 }
 
