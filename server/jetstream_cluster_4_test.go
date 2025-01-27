@@ -4237,99 +4237,98 @@ func TestJetStreamClusterPreserveWALDuringCatchupWithMatchingTerm(t *testing.T) 
 
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:     "TEST",
-		Subjects: []string{"foo.>"},
+		Subjects: []string{"foo"},
 		Replicas: 3,
 	})
-	nc.Close()
 	require_NoError(t, err)
 
-	fmt.Printf("[XXX] Stream leader: %s\n", c.streamLeader(globalAccountName, "TEST").Name())
+	sl := c.streamLeader(globalAccountName, "TEST")
+	require_NoError(t, err)
+	acc, err := sl.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+	rn := mset.raftNode().(*raft)
+	leaderId := rn.ID()
+
+	fmt.Printf("[XXX] Stream leader: %s\n", sl.Name())
 
 	// Pick one server that will only store a part of the messages in its WAL.
 	rs := c.randomNonStreamLeader(globalAccountName, "TEST")
 	fmt.Printf("[XXX] Random non leader node: %s\n", rs.Name())
-	ts := time.Now().UnixNano()
 
-	// Manually add 3 append entries to each node's WAL, except for one node who is one behind.
-	var scratch [1024]byte
-	for _, s := range c.servers {
-		for _, n := range s.raftNodes {
-			rn := n.(*raft)
-			if rn.accName == globalAccountName {
-				for i := uint64(0); i < 3; i++ {
-					// One server will be one behind and need to catchup.
-					if s.Name() == rs.Name() && i >= 2 {
-						fmt.Printf("[XXX][%s/%s] Skip last WAL AE\n", s.Name(), rn.ID())
-						break
-					}
+	for i := 0; i < 3; i++ {
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+	}
+	nc.Close()
 
-					fmt.Printf("[XXX][%s/%s] storing WAL AE %d (%d/3)\n", s.Name(), rn.ID(), i, i+1)
-
-					esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, i, ts, true, false)
-					entries := []*Entry{newEntry(EntryNormal, esm)}
-					rn.Lock()
-					ae := rn.buildAppendEntry(entries)
-					ae.buf, err = ae.encode(scratch[:])
-					require_NoError(t, err)
-					err = rn.storeToWAL(ae)
-					rn.Unlock()
-					require_NoError(t, err)
+	checkConsistency := func() {
+		t.Helper()
+		checkFor(t, 3*time.Second, 250*time.Millisecond, func() error {
+			for _, s := range c.servers {
+				acc, err := s.lookupAccount(globalAccountName)
+				if err != nil {
+					return err
+				}
+				mset, err := acc.lookupStream("TEST")
+				if err != nil {
+					return err
+				}
+				state := mset.state()
+				if state.Msgs != 3 || state.Bytes != 99 {
+					fmt.Printf("[XXX][%s/%s]: Messages: %d/%d bytes: %d/%d\n", s.Name(), s.ID(), state.Msgs, 3, state.Bytes, 99)
+					return fmt.Errorf("stream state didn't match, got %d messages with %d bytes", state.Msgs, state.Bytes)
 				}
 			}
-		}
+			return nil
+		})
 	}
+	checkConsistency()
 
-	// Restart all.
-	c.stopAll()
-	c.restartAll()
-	c.waitOnAllCurrent()
-	c.waitOnStreamLeader(globalAccountName, "TEST")
+	acc, err = rs.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err = acc.lookupStream("TEST")
+	require_NoError(t, err)
+	rn = mset.raftNode().(*raft)
+	index, commit, _ := rn.Progress()
+	require_Equal(t, index, 4)
+	require_Equal(t, index, commit)
 
-	fmt.Printf("[XXX] Stream leader after restart: %s\n", c.streamLeader(globalAccountName, "TEST").Name())
-
-	rs = c.serverByName(rs.Name())
+	// We'll simulate as-if the last message was never received/stored.
+	// Will need to truncate the stream, correct lseq (so the msg isn't skipped) and truncate the WAL.
+	// This will simulate that the RAFT layer can restore it.
+	mset.mu.Lock()
+	mset.lseq--
+	err = mset.store.Truncate(2)
+	mset.mu.Unlock()
+	require_NoError(t, err)
+	rn.Lock()
+	rn.truncateWAL(rn.pterm, rn.pindex-1)
+	rn.Unlock()
 
 	// Check all servers ended up with all published messages, which had quorum.
-	checkFor(t, 3*time.Second, 250*time.Millisecond, func() error {
-		for _, s := range c.servers {
-			acc, err := s.lookupAccount(globalAccountName)
-			if err != nil {
-				return err
-			}
-			mset, err := acc.lookupStream("TEST")
-			if err != nil {
-				return err
-			}
-			state := mset.state()
-			if state.Msgs != 3 || state.Bytes != 99 {
-				fmt.Printf("[XXX][%s/%s]: Messages: %d/%d bytes: %d/%d\n", s.Name(), s.ID(), state.Msgs, 3, state.Bytes, 99)
-				return fmt.Errorf("stream state didn't match, got %d messages with %d bytes", state.Msgs, state.Bytes)
-			}
-		}
-		return nil
-	})
-
-	fmt.Printf("[XXX] Stream leader before final check: %s\n", c.streamLeader(globalAccountName, "TEST").Name())
+	checkConsistency()
 
 	// Check that the first two published messages came from our WAL, and
 	// the last came from a catchup by another leader.
 	for _, n := range rs.raftNodes {
 		rn := n.(*raft)
 		if rn.accName == globalAccountName {
-			ae, err := rn.loadEntry(2)
+			ae, err := rn.loadEntry(1)
+			require_NoError(t, err)
+			fmt.Printf("[XXX][%s/%s] AE 1 leader: %s (expected: %s)\n", rs.Name(), rn.ID(), ae.leader, rn.ID())
+			require_Equal(t, ae.leader, leaderId)
+
+			ae, err = rn.loadEntry(2)
 			require_NoError(t, err)
 			fmt.Printf("[XXX][%s/%s] AE 2 leader: %s (expected: %s)\n", rs.Name(), rn.ID(), ae.leader, rn.ID())
-			require_True(t, ae.leader == rn.ID())
+			require_Equal(t, ae.leader, leaderId)
 
 			ae, err = rn.loadEntry(3)
 			require_NoError(t, err)
 			fmt.Printf("[XXX][%s/%s] AE 3 leader: %s (expected: %s)\n", rs.Name(), rn.ID(), ae.leader, rn.ID())
-			require_True(t, ae.leader == rn.ID())
-
-			ae, err = rn.loadEntry(4)
-			require_NoError(t, err)
-			fmt.Printf("[XXX][%s/%s]AE 4 leader: %s (expected: not %s)\n", rs.Name(), rn.ID(), ae.leader, rn.ID())
-			require_True(t, ae.leader != rn.ID())
+			require_Equal(t, ae.leader, leaderId)
 		}
 	}
 }
